@@ -1,0 +1,11 @@
+numpy
+Pillow
+pycocotools
+torch
+torchvision
+tqdm
+
+# Install these projects separately, preferably in editable mode:
+# GroundingDINO: https://github.com/IDEA-Research/GroundingDINO
+# YOLO-World:    https://github.com/AILab-CVC/YOLO-World
+# SAM2:          https://github.com/facebookresearch/sam2

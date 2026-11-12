@@ -771,7 +771,7 @@ class MV3DISBase:
     def region_growth_scannetpp(self, adjacency, threshold, seg_labels=None):
         """Grow ScanNet++ regions while caching each root's sorted members."""
         direct_neighbors = self.seg_indirect_neighbors[0]
-        second_order_neighbors = self.seg_indirect_neighbors[1]
+        second_order_neighbors = self.seg_indirect_neighbors[1].copy()
         second_order_neighbors[direct_neighbors == 1] = 0
 
         node_count = len(adjacency)
@@ -808,7 +808,7 @@ class MV3DISBase:
 
         neighbors = [row.nonzero()[0] for row in direct_neighbors]
         processed = [False] * node_count
-        for node in range(node_count):
+        for node in np.argsort(-np.asarray(self.seg_member_count), kind="stable"):
             if processed[node]:
                 continue
             visited = [False] * node_count

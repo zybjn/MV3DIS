@@ -1110,7 +1110,15 @@ def build_argument_parser():
         "--end", type=int, default=312, help="how many views to select one view from"
     )
 
-    parser.add_argument('--scannetpp_growth', nargs=3, type=float, default=(.8, .65, .6))
+    # ScanNet++ region-growing thresholds for the three stages.
+    # Stage-specific thresholds (0.8, 0.65, 0.6) performed better than a uniform threshold of 0.7.
+    # parser.add_argument('--scannetpp_growth', nargs=3, type=float, default=(0.7, 0.7, 0.7))
+    parser.add_argument(
+        '--scannetpp_growth',
+        nargs=3,
+        type=float,
+        default=(0.8, 0.65, 0.6),
+    )
     parser.add_argument('--scannetpp_knn', type=int, default=16)
     parser.add_argument('--scratch_root', type=Path, default=None)
     parser.add_argument(

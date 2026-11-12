@@ -3,6 +3,13 @@ The code has been refactored by CodeX.
 """
 
 import argparse
+import gc
+import resource
+import sys
+import tempfile
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
+from plyfile import PlyData
 import glob
 import json
 import os
@@ -242,7 +249,6 @@ class ScanNetMV3DIS(MV3DISBase):
             color_image = np.stack(color_image, 0)
             ori_color_image = np.stack(ori_color_image, 0)
 
-            # Preserve the legacy loader's GT-file validation side effect.
             _ = load_ids(
                 os.path.join(
                     "",
@@ -392,7 +398,6 @@ class ScanNetMV3DIS(MV3DISBase):
             dtype=np.int64,
         )
 
-        # Keep the historical tuple shape; unused inference fields remain None.
 
         return (
             poses,
@@ -738,6 +743,243 @@ def export_merged_ids_for_eval(
 # -----------------------------------------------------------------------------
 
 
+
+# ScanNet++ integration: enabled only by --scannetpp.
+def update_masks_int32(mask_list, keep_idx2, mask_weight):
+    """Build frame labels without allocating a K x H x W id layer."""
+    frame_count = len(mask_list)
+    height, width = mask_list[0].shape[1:]
+    masks_2D = np.zeros((frame_count, height, width), dtype=np.int32)
+
+    for frame_index in range(frame_count):
+        masks = mask_list[frame_index]
+        keep = keep_idx2[frame_index]
+        weights = mask_weight[frame_index]
+        indices = np.where(keep)[0]
+        if len(indices) == 0:
+            continue
+
+        selected_weights = weights[indices]
+        order = np.lexsort((indices, -selected_weights))
+        ordered_indices = indices[order]
+        class_ids = np.arange(len(indices), 0, -1)
+        layer_dtype = np.result_type(masks.dtype, class_ids.dtype)
+        frame_max = np.zeros((height, width), dtype=layer_dtype)
+        candidate = np.empty((height, width), dtype=layer_dtype)
+
+        for mask_index, class_id in zip(ordered_indices, class_ids):
+            np.multiply(
+                masks[mask_index],
+                class_id,
+                out=candidate,
+                casting="unsafe",
+            )
+            np.maximum(frame_max, candidate, out=frame_max)
+
+        masks_2D[frame_index] = frame_max
+    return masks_2D
+
+
+@contextmanager
+def scannetpp_runtime():
+    """Limit compatibility/memory switches to the dedicated PP invocation."""
+    original_update = utils.update_masks
+    original_similarity = utils.torch_get_similar_confidence_matrix
+    utils.update_masks = update_masks_int32
+    utils.torch_get_similar_confidence_matrix = (
+        utils.old_torch_get_similar_confidence_matrix_per_frame_transfer
+    )
+    try:
+        yield
+    finally:
+        utils.update_masks = original_update
+        utils.torch_get_similar_confidence_matrix = original_similarity
+
+
+def load_colmap_cameras(iphone_dir):
+    """Read registered cameras only, preserving the prior raw10 export mapping."""
+    cameras, poses, camera_ids = {}, {}, {}
+    for line in (iphone_dir / 'colmap/cameras.txt').read_text().splitlines():
+        if not line or line.startswith('#'):
+            continue
+        fields = line.split()
+        if fields[1] != 'OPENCV':
+            raise ValueError('Expected OPENCV COLMAP camera: ' + fields[1])
+        fx, fy, cx, cy = map(float, fields[4:8])
+        cameras[int(fields[0])] = np.array(
+            [[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32
+        )
+    lines = iter((iphone_dir / 'colmap/images.txt').read_text().splitlines())
+    for line in lines:
+        if not line or line.startswith('#'):
+            continue
+        fields = line.split()
+        next(lines, None)
+        raw_id = int(Path(fields[9]).stem.split('_')[-1])
+        if raw_id % 10:
+            raise ValueError('Expected raw10 image exports')
+        frame = f'{raw_id // 10:05d}'
+        q = np.array(fields[1:5], dtype=float)
+        q /= np.linalg.norm(q)
+        w, x, y, z = q
+        rotation = np.array([
+            [1-2*y*y-2*z*z, 2*x*y-2*w*z, 2*x*z+2*w*y],
+            [2*x*y+2*w*z, 1-2*x*x-2*z*z, 2*y*z-2*w*x],
+            [2*x*z-2*w*y, 2*y*z+2*w*x, 1-2*x*x-2*y*y],
+        ])
+        w2c = np.eye(4)
+        w2c[:3, :3] = rotation
+        w2c[:3, 3] = np.array(fields[5:8], dtype=float)
+        poses[frame] = np.linalg.inv(w2c).astype(np.float32)
+        camera_ids[frame] = int(fields[8])
+    return poses, {f: cameras[camera_ids[f]] for f in poses}
+
+
+class ScanNetPPMV3DIS(ScanNetMV3DIS):
+    """Keep upstream stages; override only PP loading, graph size and growth."""
+
+    def __init__(self, points, args):
+        if not args.scannetpp:
+            raise ValueError('ScanNetPPMV3DIS requires --scannetpp')
+        if args.max_neighbor_distance != 2:
+            raise ValueError('The preserved configuration uses max_neighbor_distance=2')
+        super().__init__(points, args)
+        self._growth_stage = 0
+        self._growth_thresholds = tuple(args.scannetpp_growth)
+
+    def get_seg_data(self, *args, **kwargs):
+        if len(args) > 5:
+            raise TypeError('Pass k_graph and subsequent options by keyword')
+        kwargs['k_graph'] = self.args.scannetpp_knn
+        return super().get_seg_data(*args, **kwargs)
+
+    def region_growth_scannet(self, adjacency, threshold, seg_labels=None):
+        if self._growth_stage >= len(self._growth_thresholds):
+            raise RuntimeError('Unexpected extra growth stage')
+        value = self._growth_thresholds[self._growth_stage]
+        self._growth_stage += 1
+        print('SCANNETPP_GROWTH_STAGE', self._growth_stage, value, flush=True)
+        return self.region_growth_scannetpp(adjacency, value, seg_labels)
+
+    def get_mask_data(self, data2d_path, scene_id, mask_name,
+                      need_semantic=False, scannetpp=False, inference_fast=False):
+        if not scannetpp:
+            raise ValueError('This adapter accepts ScanNet++ only')
+        iphone = Path(data2d_path) / scene_id / 'iphone'
+        paths = natsorted((iphone / 'color').glob('*.jpg'))
+        if not paths:
+            raise FileNotFoundError(str(iphone / 'color'))
+        image = cv2.imread(str(paths[0]))
+        if image is None:
+            raise ValueError('Unreadable color image: ' + str(paths[0]))
+        height, width = image.shape[:2]
+        mask_root = Path(self.args.sam2d_path)
+        candidates = [mask_root / f'{scene_id}.pth',
+                      mask_root / '2d_pth_score' / f'{scene_id}.pth']
+        mask_path = next((p for p in candidates if p.is_file()), None)
+        if mask_path is None:
+            raise FileNotFoundError('No mask PTH found: ' + str(candidates))
+        data = torch.load(mask_path, map_location='cpu', weights_only=False)
+        registered = scene_id in self.args.colmap_scenes.split(',')
+        camera_poses, camera_intrinsics = load_colmap_cameras(iphone) if registered else ({}, {})
+        poses, color_k, depth_k, depths, masks, scores, used = [], [], [], [], [], [], []
+        for index, path in enumerate(tqdm(paths, desc='Read ScanNet++ 2D data')):
+            if index % self.view_freq:
+                continue
+            frame = f'{int(path.stem):05d}'
+            if registered and frame not in camera_poses:
+                continue
+            decoded, confidence = utils.get_mask_list_grounding_sam(data, frame)
+            if decoded is None:
+                continue
+            depth = utils.get_scannetpp_depth(str(path), (height, width, 3))
+            if depth is None:
+                continue
+            if registered:
+                pose, intrinsic = camera_poses[frame], camera_intrinsics[frame]
+                color_intrinsic, depth_intrinsic = intrinsic, intrinsic.copy()
+            else:
+                pose = utils.get_scannet_pose(str(path))
+                color_intrinsic, depth_intrinsic = utils.get_scannetpp_color_and_depth_intrinsic(str(path))
+            if not np.isfinite(pose).all():
+                raise ValueError('Invalid pose: ' + str(path))
+            if getattr(self.args, '_scene_scratch', None):
+                target = np.memmap(Path(self.args._scene_scratch) / f'{len(masks):06d}.dat',
+                                   mode='w+', dtype=decoded.dtype, shape=decoded.shape)
+                target[:] = decoded
+                target.flush()
+                decoded = target
+            poses.append(pose)
+            color_k.append(color_intrinsic)
+            depth_k.append(depth_intrinsic)
+            depths.append(depth)
+            masks.append(decoded)
+            scores.append(confidence.reshape(-1))
+            used.append(frame)
+        if not masks:
+            raise ValueError('No usable frames: ' + scene_id)
+        self.selected_frame_ids = used
+        self.pose_source = 'registered_colmap' if registered else 'exported'
+        return (np.stack(poses), np.stack(color_k), np.stack(depth_k), np.stack(depths),
+                None, None, masks, None, scores, None, None)
+
+
+def load_points(path):
+    vertex = PlyData.read(str(path))['vertex'].data
+    return np.column_stack([vertex['x'], vertex['y'], vertex['z']]).astype(np.float32)
+
+
+def run_scene(args, scene):
+    args.scene_id = scene
+    globals()["args"] = args  # Existing get_seg_data reads this module-level value.
+    ply = Path(args.base_dir) / 'data' / scene / 'scans/mesh_aligned_0.05.ply'
+    points = load_points(ply)
+    agent = ScanNetPPMV3DIS(points, args)
+    agent.init_data(scene, args.data2d_path, args.mask_name, inference_fast=True)
+    labels = agent.assign_label(points, args.thres_connect, args.thres_dis,
+                                args.max_neighbor_distance, args.similar_metric,
+                                scene_id=scene)
+    if agent._growth_stage != 3:
+        raise RuntimeError('Expected exactly three ScanNet++ growth stages')
+    process_points_labels(labels, str(Path(args.eval_dir) / 'final'), scene)
+    report = dict(scene=scene, frames=agent.selected_frame_ids, pose_source=agent.pose_source,
+                  points=len(points), k_graph=args.scannetpp_knn,
+                  growth=list(args.scannetpp_growth), view_freq=args.view_freq)
+    (Path(args.eval_dir) / f'{scene}.metadata.json').write_text(json.dumps(report, indent=2))
+    del agent, points, labels
+    gc.collect()
+
+
+def run_scannetpp(args):
+    if args.scene_id is None:
+        raise SystemExit('--scene_id is required (comma-separated scene IDs are supported)')
+    if not args.eval_dir:
+        raise SystemExit('--eval_dir is required')
+    output = Path(args.eval_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    processed = output / 'processed.txt'
+    completed = set(processed.read_text().splitlines()) if processed.exists() else set()
+    if args.scratch_root:
+        args.scratch_root.mkdir(parents=True, exist_ok=True)
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = 8192 if hard == resource.RLIM_INFINITY else min(8192, hard)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, target), hard))
+    scenes = args.scene_id.split(',')[args.begin:]
+    with scannetpp_runtime():
+        for scene in scenes:
+            if scene in completed and (output / 'final' / f'{scene}.pth').is_file():
+                print('Already completed:', scene)
+                continue
+            context = tempfile.TemporaryDirectory(prefix=f'{scene}_', dir=args.scratch_root) if args.scratch_root else nullcontext(None)
+            with context as scratch:
+                args._scene_scratch = scratch
+                run_scene(args, scene)
+            # Mark only AFTER a complete, successful prediction.
+            with processed.open('a') as stream:
+                stream.write(scene + '\n')
+            completed.add(scene)
+
+
 def build_argument_parser():
     """Build the command-line interface without changing historical defaults."""
     parser = argparse.ArgumentParser()
@@ -868,14 +1110,31 @@ def build_argument_parser():
         "--end", type=int, default=312, help="how many views to select one view from"
     )
 
+    parser.add_argument('--scannetpp_growth', nargs=3, type=float, default=(.8, .65, .6))
+    parser.add_argument('--scannetpp_knn', type=int, default=16)
+    parser.add_argument('--scratch_root', type=Path, default=None)
+    parser.add_argument(
+    '--colmap_scenes',
+    type=str,
+    default='',
+    help='Optional comma-separated ScanNet++ scene IDs that use COLMAP camera poses. '
+         'By default, all scenes use the original exported camera poses. d755b3d9d8', 
+    )
     return parser
 
 
-def main():
-    """Run ScanNetV2 inference for the requested validation scenes."""
+def main(argv=None):
+    """Run dataset-specific inference for the requested scenes."""
     global args
 
-    args = build_argument_parser().parse_args()
+    argv = sys.argv[1:] if argv is None else argv
+    parser = build_argument_parser()
+    if '--scannetpp' in argv:
+        parser.set_defaults(view_freq=2)
+    args = parser.parse_args(argv)
+    if args.scannetpp:
+        run_scannetpp(args)
+        return
     _train_split, val_split = utils.get_splits(args.base_dir, args.scannetpp)
     print("eval_dir", args.eval_dir)
     seg_split = val_split
